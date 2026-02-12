@@ -219,6 +219,10 @@ func gitRefsKey(repo string) string {
 	return "git-refs|" + repo
 }
 
+func gitResolvedRefsKey(repo, revision string) string {
+	return "git-resolved-refs|" + repo + "|" + revision
+}
+
 // SetGitReferences saves resolved Git repository references to cache
 func (c *Cache) SetGitReferences(repo string, references []*plumbing.Reference) error {
 	var input [][2]string
@@ -317,6 +321,98 @@ func (c *Cache) UnlockGitReferences(repo string, lockId string) error {
 		input[0][1] == lockId {
 		// We have the lock, so remove it
 		return c.cache.SetItem(gitRefsKey(repo), input, &cacheutil.CacheActionOpts{Delete: true})
+	}
+	return err
+}
+
+// SetResolvedGitReference stores a resolved Git reference (revision -> commit SHA).
+// The value is encoded as [][2]string{{"", sha}} so it shares the same format as the
+// first-layer ref cache. This lets the lock sentinel (CacheLockedValue / "locked") be
+// distinguished from real data by inspecting input[0][0], and also means that calling
+// SetResolvedGitReference naturally overwrites an existing lock (no explicit unlock needed
+// on the success path).
+func (c *Cache) SetResolvedGitReference(repo, revision, sha string) error {
+	return c.cache.SetItem(gitResolvedRefsKey(repo, revision), [][2]string{{"", sha}},
+		&cacheutil.CacheActionOpts{Expiration: c.revisionCacheExpiration})
+}
+
+// GetResolvedGitReference retrieves the raw cache state for the given repo/revision.
+// Mirrors GetGitReferences: returns (foundLockId, error) and populates *sha when real data is present.
+func (c *Cache) GetResolvedGitReference(repo, revision string, sha *string) (string, error) {
+	var input [][2]string
+	err := c.cache.GetItem(gitResolvedRefsKey(repo, revision), &input)
+	valueExists := len(input) > 0 && len(input[0]) > 1
+	switch {
+	case err != nil && !errors.Is(err, ErrCacheMiss):
+		log.Errorf("Error attempting to retrieve resolved git reference from cache: %v", err)
+		return "", err
+	// Data found (not a lock sentinel)
+	case valueExists && input[0][0] != cacheutil.CacheLockedValue:
+		*sha = input[0][1]
+		return "", nil
+	// Key is locked — return the lockId so callers can detect ownership
+	case valueExists:
+		return input[0][1], nil
+	// Cache miss
+	default:
+		return "", nil
+	}
+}
+
+// TryLockResolvedGitRefCache attempts to lock the resolved-ref key via SET NX.
+// Mirrors TryLockGitRefCache: writes the lock sentinel and returns the current foundLockId.
+func (c *Cache) TryLockResolvedGitRefCache(repo, revision, lockId string, sha *string) (string, error) {
+	err := c.cache.SetItem(gitResolvedRefsKey(repo, revision), [][2]string{{cacheutil.CacheLockedValue, lockId}},
+		&cacheutil.CacheActionOpts{
+			Expiration:       c.revisionCacheLockTimeout,
+			DisableOverwrite: true,
+		})
+	if err != nil {
+		log.Errorf("Error attempting to acquire resolved git reference cache lock: %v", err)
+	}
+	return c.GetResolvedGitReference(repo, revision, sha)
+}
+
+// GetOrLockResolvedGitReference retrieves the resolved SHA if cached, otherwise acquires a
+// distributed lock so that only one caller performs the remote resolution.
+// Mirrors GetOrLockGitReferences.
+//
+// Return semantics:
+//   - ("", nil) with *sha set  → cache hit; caller should return *sha directly
+//   - (lockId, nil)            → caller owns the lock; must resolve and call SetResolvedGitReference
+//   - ("", err)                → unexpected error
+func (c *Cache) GetOrLockResolvedGitReference(repo, revision, lockId string, sha *string) (string, error) {
+	// Value matches the ttl on the lock in TryLockResolvedGitRefCache
+	waitUntil := time.Now().Add(c.revisionCacheLockTimeout)
+	// Wait only the maximum amount of time configured for the lock
+	// if the configured time is zero then the for loop will never run and instead act as the owner immediately
+	for time.Now().Before(waitUntil) {
+		if foundLockId, err := c.GetResolvedGitReference(repo, revision, sha); foundLockId == lockId || err != nil || *sha != "" {
+			return foundLockId, err
+		}
+		if foundLockId, err := c.TryLockResolvedGitRefCache(repo, revision, lockId, sha); foundLockId == lockId || err != nil || *sha != "" {
+			return foundLockId, err
+		}
+		time.Sleep(1 * time.Second)
+	}
+	if c.revisionCacheLockTimeout > 0 {
+		log.Debug("Resolved reference cache was unable to acquire lock or valid data within timeout")
+	}
+	return lockId, nil
+}
+
+// UnlockResolvedGitReference releases the lock for the given repo/revision if we still own it.
+// Mirrors UnlockGitReferences.
+func (c *Cache) UnlockResolvedGitReference(repo, revision, lockId string) error {
+	var input [][2]string
+	var err error
+	if err = c.cache.GetItem(gitResolvedRefsKey(repo, revision), &input); err == nil &&
+		input != nil &&
+		len(input) > 0 &&
+		len(input[0]) > 1 &&
+		input[0][0] == cacheutil.CacheLockedValue &&
+		input[0][1] == lockId {
+		return c.cache.SetItem(gitResolvedRefsKey(repo, revision), input, &cacheutil.CacheActionOpts{Delete: true})
 	}
 	return err
 }
