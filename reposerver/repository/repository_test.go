@@ -419,8 +419,8 @@ func TestGenerateManifest_RefOnlyShortCircuit(t *testing.T) {
 	_, err := service.GenerateManifest(t.Context(), &q)
 	require.NoError(t, err)
 	cacheMocks.mockCache.AssertCacheCalledTimes(t, &repositorymocks.CacheCallCounts{
-		ExternalSets: 2,
-		ExternalGets: 2,
+		ExternalSets: 3,
+		ExternalGets: 3,
 	})
 	assert.True(t, lsremoteCalled, "ls-remote should be called when the source is ref only")
 	var revisions [][2]string
@@ -489,7 +489,7 @@ func TestGenerateManifestsHelmWithRefs_CachedNoLsRemote(t *testing.T) {
 	_, err = service.GenerateManifest(t.Context(), &q)
 	require.NoError(t, err)
 	cacheMocks.mockCache.AssertCacheCalledTimes(t, &repositorymocks.CacheCallCounts{
-		ExternalSets: 2,
+		ExternalSets: 3,
 		ExternalGets: 5,
 	})
 }
