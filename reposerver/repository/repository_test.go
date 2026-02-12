@@ -406,7 +406,7 @@ func TestGenerateManifests_EmptyCache(t *testing.T) {
 // Test that when Generate manifest is called with a source that is ref only it does not try to generate manifests or hit the manifest cache
 // but it does resolve and cache the revision
 func TestGenerateManifest_RefOnlyShortCircuit(t *testing.T) {
-	lsremoteCalled := false
+	lsRemoteViaFetchCalled := false
 	dir := t.TempDir()
 	repopath := dir + "/tmprepo"
 	repoRemote := "file://" + repopath
@@ -416,9 +416,14 @@ func TestGenerateManifest_RefOnlyShortCircuit(t *testing.T) {
 	service.newGitClient = func(rawRepoURL string, root string, creds git.Creds, insecure bool, enableLfs bool, proxy string, noProxy string, opts ...git.ClientOpts) (client git.Client, e error) {
 		opts = append(opts, git.WithEventHandlers(git.EventHandlers{
 			// Primary check, we want to make sure ls-remote is not called when the item is in cache
+			OnLsRemoteViaFetch: func(_ string) func() {
+				return func() {
+					lsRemoteViaFetchCalled = true
+				}
+			},
 			OnLsRemote: func(_ string) func() {
 				return func() {
-					lsremoteCalled = true
+					assert.Fail(t, "LsRemote should not be called from GenerateManifest as lsRemoteViaFetch should be used instead")
 				}
 			},
 			OnFetch: func(_ string) func() {
@@ -454,10 +459,12 @@ func TestGenerateManifest_RefOnlyShortCircuit(t *testing.T) {
 		ExternalSets: 2,
 		ExternalGets: 2,
 	})
-	assert.True(t, lsremoteCalled, "ls-remote should be called when the source is ref only")
+	assert.True(t, lsRemoteViaFetchCalled, "ls-remote via fetch should be called when the source is ref only")
+	var input [][2]string
+	require.NoError(t, cacheMocks.cacheutilCache.GetItem("git-resolved-refs|"+repoRemote+"|HEAD", &input))
+	assert.Equal(t, revision, input[0][1])
 	var revisions [][2]string
-	require.NoError(t, cacheMocks.cacheutilCache.GetItem("git-refs|"+repoRemote, &revisions))
-	assert.ElementsMatch(t, [][2]string{{"refs/heads/main", revision}, {"HEAD", "ref: refs/heads/main"}}, revisions)
+	require.ErrorIs(t, cache.ErrCacheMiss, cacheMocks.cacheutilCache.GetItem("git-refs|"+repoRemote, &revisions))
 }
 
 // Test that calling manifest generation on source helm reference helm files that when the revision is cached it does not call ls-remote
@@ -482,6 +489,11 @@ func TestGenerateManifestsHelmWithRefs_CachedNoLsRemote(t *testing.T) {
 	service.newGitClient = func(rawRepoURL string, root string, creds git.Creds, insecure bool, enableLfs bool, proxy string, noProxy string, opts ...git.ClientOpts) (client git.Client, e error) {
 		opts = append(opts, git.WithEventHandlers(git.EventHandlers{
 			// Primary check, we want to make sure ls-remote is not called when the item is in cache
+			OnLsRemoteViaFetch: func(_ string) func() {
+				return func() {
+					assert.Fail(t, "LsRemote via Fetch should not be called when the item is in cache")
+				}
+			},
 			OnLsRemote: func(_ string) func() {
 				return func() {
 					assert.Fail(t, "LsRemote should not be called when the item is in cache")
@@ -516,7 +528,7 @@ func TestGenerateManifestsHelmWithRefs_CachedNoLsRemote(t *testing.T) {
 		ProjectSourceRepos: []string{"*"},
 		RefSources:         map[string]*v1alpha1.RefTarget{"$ref": {TargetRevision: "HEAD", Repo: *repo}},
 	}
-	err = cacheMocks.cacheutilCache.SetItem("git-refs|"+repoRemote, [][2]string{{"HEAD", revision}}, nil)
+	err = cacheMocks.cacheutilCache.SetItem("git-resolved-refs|"+repoRemote+"|HEAD", [][2]string{{"", revision}}, nil)
 	require.NoError(t, err)
 	_, err = service.GenerateManifest(t.Context(), &q)
 	require.NoError(t, err)

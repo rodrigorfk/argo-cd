@@ -32,8 +32,9 @@ type MetricsServer struct {
 type GitRequestType string
 
 const (
-	GitRequestTypeLsRemote = "ls-remote"
-	GitRequestTypeFetch    = "fetch"
+	GitRequestTypeLsRemote         = "ls-remote"
+	GitRequestTypeLsRemoteViaFetch = "ls-remote-via-fetch"
+	GitRequestTypeFetch            = "fetch"
 )
 
 // NewMetricsServer returns a new prometheus server which collects application metrics.

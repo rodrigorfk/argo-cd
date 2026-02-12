@@ -24,6 +24,22 @@ func init() {
 
 // NewGitClientEventHandlers creates event handlers that update Git related metrics
 func NewGitClientEventHandlers(metricsServer *MetricsServer) git.EventHandlers {
+	lsRemoteSemaphoreLogic := func(repo string, requestType GitRequestType) func() {
+		startTime := time.Now()
+		metricsServer.IncGitRequest(repo, requestType)
+		if lsRemoteParallelismLimitSemaphore != nil {
+			// The `Acquire` method returns either `nil` or error of the provided context. The
+			// context.Background() is never canceled, so it is safe to ignore the error.
+			_ = lsRemoteParallelismLimitSemaphore.Acquire(context.Background(), 1)
+		}
+		return func() {
+			if lsRemoteParallelismLimitSemaphore != nil {
+				lsRemoteParallelismLimitSemaphore.Release(1)
+			}
+			metricsServer.ObserveGitRequestDuration(repo, requestType, time.Since(startTime))
+		}
+	}
+
 	return git.EventHandlers{
 		OnFetch: func(repo string) func() {
 			startTime := time.Now()
@@ -33,19 +49,10 @@ func NewGitClientEventHandlers(metricsServer *MetricsServer) git.EventHandlers {
 			}
 		},
 		OnLsRemote: func(repo string) func() {
-			startTime := time.Now()
-			metricsServer.IncGitRequest(repo, GitRequestTypeLsRemote)
-			if lsRemoteParallelismLimitSemaphore != nil {
-				// The `Acquire` method returns either `nil` or error of the provided context. The
-				// context.Background() is never canceled, so it is safe to ignore the error.
-				_ = lsRemoteParallelismLimitSemaphore.Acquire(context.Background(), 1)
-			}
-			return func() {
-				if lsRemoteParallelismLimitSemaphore != nil {
-					lsRemoteParallelismLimitSemaphore.Release(1)
-				}
-				metricsServer.ObserveGitRequestDuration(repo, GitRequestTypeLsRemote, time.Since(startTime))
-			}
+			return lsRemoteSemaphoreLogic(repo, GitRequestTypeLsRemote)
+		},
+		OnLsRemoteViaFetch: func(repo string) func() {
+			return lsRemoteSemaphoreLogic(repo, GitRequestTypeLsRemoteViaFetch)
 		},
 	}
 }

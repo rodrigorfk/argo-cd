@@ -550,6 +550,106 @@ func TestGetOrLockGitReferences(t *testing.T) {
 	})
 }
 
+func TestGetOrLockResolvedGitReference(t *testing.T) {
+	t.Run("acquires lock on cache miss", func(t *testing.T) {
+		fixtures := newFixtures()
+		t.Cleanup(fixtures.mockCache.StopRedisCallback)
+		cache := fixtures.cache
+		var sha string
+		lockId, err := cache.GetOrLockResolvedGitReference("test-repo", "main", "my-lock-id", &sha)
+		require.NoError(t, err)
+		assert.Equal(t, "my-lock-id", lockId, "Should become lock owner on cache miss")
+		assert.Empty(t, sha)
+	})
+
+	t.Run("returns cached SHA without lock", func(t *testing.T) {
+		fixtures := newFixtures()
+		t.Cleanup(fixtures.mockCache.StopRedisCallback)
+		cache := fixtures.cache
+		err := cache.SetResolvedGitReference("test-repo", "main", "abc123")
+		require.NoError(t, err)
+		var sha string
+		lockId, err := cache.GetOrLockResolvedGitReference("test-repo", "main", "my-lock-id", &sha)
+		require.NoError(t, err)
+		assert.Empty(t, lockId, "Should not acquire lock when data already cached")
+		assert.Equal(t, "abc123", sha)
+	})
+
+	t.Run("second caller waits and then gets cached SHA", func(t *testing.T) {
+		fixtures := newFixtures()
+		t.Cleanup(fixtures.mockCache.StopRedisCallback)
+		cache := fixtures.cache
+		// First caller acquires the lock.
+		var sha1 string
+		lockId1, err := cache.GetOrLockResolvedGitReference("test-repo", "main", "lock-1", &sha1)
+		require.NoError(t, err)
+		assert.Equal(t, "lock-1", lockId1)
+		// Simulate first caller writing the result.
+		err = cache.SetResolvedGitReference("test-repo", "main", "def456")
+		require.NoError(t, err)
+		// Second caller should now get the cached value.
+		var sha2 string
+		lockId2, err := cache.GetOrLockResolvedGitReference("test-repo", "main", "lock-2", &sha2)
+		require.NoError(t, err)
+		assert.Empty(t, lockId2, "Second caller should not acquire lock")
+		assert.Equal(t, "def456", sha2)
+	})
+
+	t.Run("timeout returns caller as lock owner", func(t *testing.T) {
+		fixtures := newFixtures()
+		t.Cleanup(fixtures.mockCache.StopRedisCallback)
+		cache := fixtures.cache
+		// Set timeout to zero so the loop never runs and caller is immediately returned as owner.
+		cache.revisionCacheLockTimeout = -1 * time.Second
+		var sha string
+		lockId, err := cache.GetOrLockResolvedGitReference("test-repo", "main", "my-lock-id", &sha)
+		require.NoError(t, err)
+		assert.Equal(t, "my-lock-id", lockId, "Should return caller as owner on timeout")
+	})
+}
+
+func TestUnlockResolvedGitReference(t *testing.T) {
+	fixtures := newFixtures()
+	t.Cleanup(fixtures.mockCache.StopRedisCallback)
+	cache := fixtures.cache
+
+	t.Run("returns error when no lock held", func(t *testing.T) {
+		err := cache.UnlockResolvedGitReference("test-repo", "main", "nonexistent-lock")
+		assert.ErrorContains(t, err, "key is missing")
+	})
+
+	t.Run("releases owned lock", func(t *testing.T) {
+		var sha string
+		lockId, err := cache.GetOrLockResolvedGitReference("test-repo", "main", "my-lock-id", &sha)
+		require.NoError(t, err)
+		assert.Equal(t, "my-lock-id", lockId)
+		// Release the lock.
+		err = cache.UnlockResolvedGitReference("test-repo", "main", lockId)
+		require.NoError(t, err)
+		// Key should now be absent; GetResolvedGitReference returns empty.
+		var afterSHA string
+		afterLockId, err := cache.GetResolvedGitReference("test-repo", "main", &afterSHA)
+		require.NoError(t, err)
+		assert.Empty(t, afterLockId)
+		assert.Empty(t, afterSHA)
+	})
+
+	t.Run("does not release lock owned by another caller", func(t *testing.T) {
+		var sha string
+		_, err := cache.GetOrLockResolvedGitReference("test-repo2", "main", "owner-lock", &sha)
+		require.NoError(t, err)
+		// A different caller tries to unlock — should be a no-op (lockId mismatch).
+		err = cache.UnlockResolvedGitReference("test-repo2", "main", "other-lock")
+		require.NoError(t, err)
+		// Original lock should still be held.
+		var afterSHA string
+		afterLockId, err := cache.GetResolvedGitReference("test-repo2", "main", &afterSHA)
+		require.NoError(t, err)
+		assert.Equal(t, "owner-lock", afterLockId)
+		assert.Empty(t, afterSHA)
+	})
+}
+
 func TestUnlockGitReferences(t *testing.T) {
 	fixtures := newFixtures()
 	t.Cleanup(fixtures.mockCache.StopRedisCallback)
