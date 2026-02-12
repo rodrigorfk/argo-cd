@@ -102,6 +102,9 @@ type gitRefCache interface {
 	SetGitReferences(repo string, references []*plumbing.Reference) error
 	GetOrLockGitReferences(repo string, lockId string, references *[]*plumbing.Reference) (string, error)
 	UnlockGitReferences(repo string, lockId string) error
+	SetResolvedGitReference(repo, revision, sha string) error
+	GetOrLockResolvedGitReference(repo, revision, lockId string, sha *string) (string, error)
+	UnlockResolvedGitReference(repo, revision, lockId string) error
 }
 
 // Client is a generic git client interface
@@ -661,6 +664,67 @@ func (m *nativeGitClient) LsRefs() (*Refs, error) {
 	return sortedRefs, nil
 }
 
+// lsRemoteViaFetch resolves a revision to its commit SHA by running a shallow, partial-clone
+// fetch against the remote. Unlike go-git's AdvertisedReferences() or plain 'git ls-remote',
+// 'git fetch' sends ref-prefix hints in git protocol v2, which causes the server to return only
+// the matching ref(s) instead of the entire ref list. For repositories with large numbers of
+// refs this is significantly cheaper than getRefs().
+//
+// The fetch is run in a temporary bare repository that is removed after the call. Only the
+// commit object is downloaded (--depth=1 --filter=tree:0); no trees or blobs are transferred.
+//
+// Returns the resolved SHA, or an error if the revision cannot be fetched (e.g. it does not
+// exist on the remote, the server does not support protocol v2, or credentials are invalid).
+func (m *nativeGitClient) lsRemoteViaFetch(revision string) (string, error) {
+	if m.OnLsRemote != nil {
+		done := m.OnLsRemote(m.repoURL)
+		defer done()
+	}
+
+	tmpDir, err := os.MkdirTemp("", "argocd-fetch-ref-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp dir for targeted fetch: %w", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			log.Warnf("Failed to remove temp dir %s: %v", tmpDir, err)
+		}
+	}()
+
+	// Construct a throw-away client that runs all git commands inside tmpDir,
+	// inheriting credentials, TLS, and proxy settings from the original client.
+	tmpClient := &nativeGitClient{
+		repoURL:  m.repoURL,
+		root:     tmpDir,
+		creds:    m.creds,
+		insecure: m.insecure,
+		proxy:    m.proxy,
+		noProxy:  m.noProxy,
+	}
+
+	if _, err := tmpClient.runCmd("init", "--bare"); err != nil {
+		return "", fmt.Errorf("git init --bare failed: %w", err)
+	}
+
+	// --depth=1        → only the tip commit, no history
+	// --no-tags        → do not auto-follow tags
+	// --filter=tree:0  → partial-clone: omit tree and blob objects (commit metadata only)
+	//                    servers that do not support partial clone will ignore this flag
+	//                    and deliver the full commit object, which is still correct
+	if err := tmpClient.runCredentialedCmd(
+		"fetch", "--depth=1", "--no-tags", "--filter=tree:0",
+		m.repoURL, revision,
+	); err != nil {
+		return "", fmt.Errorf("targeted fetch of %q failed: %w", revision, err)
+	}
+
+	sha, err := tmpClient.runCmd("rev-parse", "FETCH_HEAD^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("rev-parse FETCH_HEAD failed: %w", err)
+	}
+	return strings.TrimSpace(sha), nil
+}
+
 // LsRemote resolves the commit SHA of a specific branch, tag (with semantic versioning or not),
 // or HEAD. If the supplied revision does not resolve, and "looks" like a 7+ hexadecimal commit SHA,
 // it will return the revision string. Otherwise, it returns an error indicating that the revision could
@@ -701,13 +765,79 @@ func (m *nativeGitClient) lsRemote(revision string) (string, error) {
 		return revision, nil
 	}
 
+	// Normalize empty revision to HEAD upfront so that cache keys are consistent
+	// (lsRemote("") and lsRemote("HEAD") share the same cached entry).
+	if revision == "" {
+		revision = "HEAD"
+	}
+
+	// Acquire the second-layer cache lock (or return the already-cached SHA).
+	// This mirrors the getRefs() locking pattern: only the lock owner performs the remote
+	// resolution; all other concurrent callers wait and then receive the cached result.
+	myLockUUID, err := uuid.NewRandom()
+	myLockId := ""
+	if err != nil {
+		log.Debug("Error generating resolved git reference cache lock id: ", err)
+	} else {
+		myLockId = myLockUUID.String()
+	}
+	needsUnlock := false
+	if m.gitRefCache != nil && m.loadRefFromCache {
+		var cachedSHA string
+		foundLockId, err := m.gitRefCache.GetOrLockResolvedGitReference(m.repoURL, revision, myLockId, &cachedSHA)
+		isLockOwner := myLockId == foundLockId
+		switch {
+		case !isLockOwner && err == nil && cachedSHA != "":
+			// Another writer already resolved and cached the SHA.
+			log.Debugf("LsRemote resolved revision '%s' to cached SHA '%s'", revision, cachedSHA)
+			return cachedSHA, nil
+		case !isLockOwner && err != nil:
+			log.Debugf("Error getting or locking resolved git reference from cache: %v", err)
+		case isLockOwner:
+			needsUnlock = true
+			defer func() {
+				if needsUnlock {
+					if unlockErr := m.gitRefCache.UnlockResolvedGitReference(m.repoURL, revision, myLockId); unlockErr != nil {
+						log.Debugf("Error unlocking resolved git reference from cache: %v", unlockErr)
+					}
+				}
+			}()
+		}
+	}
+
+	// saveResolvedRevisionToCache writes the resolved SHA to cache.
+	// SetResolvedGitReference stores [][2]string{{"", sha}}, which overwrites the lock sentinel
+	// naturally (same key, no NX flag), so the defer unlock becomes a no-op on the success path.
+	saveResolvedRevisionToCache := func(resolvedSHA string) {
+		if m.gitRefCache != nil {
+			if err := m.gitRefCache.SetResolvedGitReference(m.repoURL, revision, resolvedSHA); err != nil {
+				log.Warnf("Failed to store resolved git reference to cache: %v", err)
+			} else {
+				// Data overwrote the lock; no explicit unlock needed.
+				needsUnlock = false
+			}
+		}
+	}
+
+	// Semver constraints (e.g. "~1.2.0") require iterating the full tag list to find the
+	// maximum matching version, so they must go through getRefs(). For all other revision
+	// types (branches, tags, HEAD, fully-qualified refs) we attempt a targeted fetch first.
+	// Git protocol v2 sends ref-prefix hints during the ls-refs phase of a fetch, causing
+	// the server to return only the matching ref(s) rather than the entire list. This avoids
+	// both the expensive Redis read of the full ref set and the remote download of all refs.
+	if !versions.IsConstraint(revision) {
+		sha, err := m.lsRemoteViaFetch(revision)
+		if err == nil {
+			log.Debugf("LsRemote targeted fetch resolved revision '%s' to '%s'", revision, sha)
+			saveResolvedRevisionToCache(sha)
+			return sha, nil
+		}
+		log.Warnf("Targeted fetch for '%s' failed, falling back to full ref list: %v", revision, err)
+	}
+
 	refs, err := m.getRefs()
 	if err != nil {
 		return "", fmt.Errorf("failed to list refs: %w", err)
-	}
-
-	if revision == "" {
-		revision = "HEAD"
 	}
 
 	maxV, err := versions.MaxVersion(revision, getGitTags(refs))
@@ -744,6 +874,7 @@ func (m *nativeGitClient) lsRemote(revision string) (string, error) {
 		if (isShortRef && ref.Name().Short() == revision) || refName == revision {
 			if ref.Type() == plumbing.HashReference {
 				log.Debugf("revision '%s' resolved to '%s'", revision, hash)
+				saveResolvedRevisionToCache(hash)
 				return hash, nil
 			}
 			if ref.Type() == plumbing.SymbolicReference {
@@ -757,6 +888,7 @@ func (m *nativeGitClient) lsRemote(revision string) (string, error) {
 		// It should exist in our refToHash map
 		if hash, ok := refToHash[refToResolve]; ok {
 			log.Debugf("symbolic reference '%s' (%s) resolved to '%s'", revision, refToResolve, hash)
+			saveResolvedRevisionToCache(hash)
 			return hash, nil
 		}
 	}
@@ -764,6 +896,7 @@ func (m *nativeGitClient) lsRemote(revision string) (string, error) {
 	// We support the ability to use a truncated commit-SHA (e.g. first 7 characters of a SHA)
 	if IsTruncatedCommitSHA(revision) {
 		log.Debugf("revision '%s' assumed to be commit sha", revision)
+		saveResolvedRevisionToCache(revision)
 		return revision, nil
 	}
 
