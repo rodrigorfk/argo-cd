@@ -26,6 +26,8 @@ type GitRequestType string
 const (
 	// GitRequestTypeLsRemote is a request to list remote refs
 	GitRequestTypeLsRemote = "ls-remote"
+	// GitRequestTypeLsRemoteViaFetch is a request to resolve a revision using a shallow, partial-clone fetch against the remote
+	GitRequestTypeLsRemoteViaFetch = "ls-remote-via-fetch"
 	// GitRequestTypeFetch is a request to fetch from remote
 	GitRequestTypeFetch = "fetch"
 	// GitRequestTypePush is a request to push to remote
