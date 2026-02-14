@@ -33,6 +33,8 @@ jobs:
     secrets:
       quay_username: ${{ secrets.RELEASE_QUAY_USERNAME }}
       quay_password: ${{ secrets.RELEASE_QUAY_TOKEN }}
+      ghcr_username: ${{ github.actor }}
+      ghcr_password: ${{ secrets.GITHUB_TOKEN }}
 
   setup-variables:
     name: Setup Release Variables
@@ -46,8 +48,8 @@ jobs:
       image_repository: ${{ steps.var.outputs.image_repository }}
       quay_image_name: ${{ steps.var.outputs.quay_image_name }}
       provenance_image: ${{ steps.var.outputs.provenance_image }}
-      ghcr_image_name: ${{ steps.image.outputs.ghcr_image_name }}
-      ghcr_provenance_image: ${{ steps.image.outputs.ghcr_provenance_image }}
+      ghcr_image_name: ${{ steps.var.outputs.ghcr_image_name }}
+      ghcr_provenance_image: ${{ steps.var.outputs.ghcr_provenance_image }}
       allow_fork_release: ${{ steps.var.outputs.allow_fork_release }}
     steps:
       - name: Checkout code
