@@ -81,7 +81,6 @@ jobs:
       - name: Setup tags for container image as a CSV type
         run: |
           IMAGE_TAGS=$(for str in \
-            ${{ inputs.quay_image_name }} \
             ${{ inputs.ghcr_image_name }} \
             ${{ inputs.docker_image_name}}; do
             echo -n "${str}",;done | sed 's/,$//')
@@ -92,7 +91,6 @@ jobs:
       - name: Setup image namespace for signing, strip off the tag
         run: |
           TAGS=$(for tag in \
-            ${{ inputs.quay_image_name }} \
             ${{ inputs.ghcr_image_name }} \
             ${{ inputs.docker_image_name}}; do
             echo -n "${tag}" | awk -F ":" '{print $1}' -;done)
@@ -101,14 +99,6 @@ jobs:
             echo 'SIGNING_TAGS<<EOF' >> $GITHUB_ENV
             echo $TAGS >> $GITHUB_ENV
             echo 'EOF' >> $GITHUB_ENV
-
-      - name: Login to Quay.io
-        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
-        with:
-          registry: quay.io
-          username: ${{ secrets.quay_username }}
-          password: ${{ secrets.quay_password }}
-        if: ${{ inputs.quay_image_name && inputs.push }}
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
