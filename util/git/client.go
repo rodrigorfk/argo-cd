@@ -677,6 +677,7 @@ func (m *nativeGitClient) getRefs() ([]*plumbing.Reference, error) {
 	}
 	res, err := listRemote(remote, &git.ListOptions{Auth: auth}, m.insecure, m.creds, m.proxy, m.noProxy)
 	if err == nil && m.gitRefCache != nil {
+		log.Debugf("Settings git references to cache for repo %s", m.repoURL)
 		if err := m.gitRefCache.SetGitReferences(m.repoURL, res); err != nil {
 			log.Warnf("Failed to store git references to cache: %v", err)
 		} else {
@@ -803,7 +804,7 @@ func (m *nativeGitClient) lsRemote(revision string) (string, error) {
 
 	// function that saves resolved revision to cache if caching is enabled
 	saveResolvedRevisionToCache := func(resolvedSHA string) {
-		if m.gitRefCache != nil && m.loadRefFromCache {
+		if m.gitRefCache != nil {
 			if err := m.gitRefCache.SetResolvedGitReference(m.repoURL, revision, resolvedSHA); err != nil {
 				log.Warnf("Failed to store resolved git reference to cache: %v", err)
 			}
