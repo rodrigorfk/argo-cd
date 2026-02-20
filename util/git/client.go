@@ -663,6 +663,67 @@ func (m *nativeGitClient) LsRefs() (*Refs, error) {
 	return sortedRefs, nil
 }
 
+// lsRemoteViaFetch resolves a revision to its commit SHA by running a shallow, partial-clone
+// fetch against the remote. Unlike go-git's AdvertisedReferences() or plain 'git ls-remote',
+// 'git fetch' sends ref-prefix hints in git protocol v2, which causes the server to return only
+// the matching ref(s) instead of the entire ref list. For repositories with large numbers of
+// refs this is significantly cheaper than getRefs().
+//
+// The fetch is run in a temporary bare repository that is removed after the call. Only the
+// commit object is downloaded (--depth=1 --filter=tree:0); no trees or blobs are transferred.
+//
+// Returns the resolved SHA, or an error if the revision cannot be fetched (e.g. it does not
+// exist on the remote, the server does not support protocol v2, or credentials are invalid).
+func (m *nativeGitClient) lsRemoteViaFetch(revision string) (string, error) {
+	if m.OnLsRemote != nil {
+		done := m.OnLsRemote(m.repoURL)
+		defer done()
+	}
+
+	tmpDir, err := os.MkdirTemp("", "argocd-fetch-ref-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp dir for targeted fetch: %w", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			log.Warnf("Failed to remove temp dir %s: %v", tmpDir, err)
+		}
+	}()
+
+	// Construct a throw-away client that runs all git commands inside tmpDir,
+	// inheriting credentials, TLS, and proxy settings from the original client.
+	tmpClient := &nativeGitClient{
+		repoURL:  m.repoURL,
+		root:     tmpDir,
+		creds:    m.creds,
+		insecure: m.insecure,
+		proxy:    m.proxy,
+		noProxy:  m.noProxy,
+	}
+
+	if _, err := tmpClient.runCmd("init", "--bare"); err != nil {
+		return "", fmt.Errorf("git init --bare failed: %w", err)
+	}
+
+	// --depth=1        → only the tip commit, no history
+	// --no-tags        → do not auto-follow tags
+	// --filter=tree:0  → partial-clone: omit tree and blob objects (commit metadata only)
+	//                    servers that do not support partial clone will ignore this flag
+	//                    and deliver the full commit object, which is still correct
+	if err := tmpClient.runCredentialedCmd(
+		"fetch", "--depth=1", "--no-tags", "--filter=tree:0",
+		m.repoURL, revision,
+	); err != nil {
+		return "", fmt.Errorf("targeted fetch of %q failed: %w", revision, err)
+	}
+
+	sha, err := tmpClient.runCmd("rev-parse", "FETCH_HEAD^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("rev-parse FETCH_HEAD failed: %w", err)
+	}
+	return strings.TrimSpace(sha), nil
+}
+
 // LsRemote resolves the commit SHA of a specific branch, tag (with semantic versioning or not),
 // or HEAD. If the supplied revision does not resolve, and "looks" like a 7+ hexadecimal commit SHA,
 // it will return the revision string. Otherwise, it returns an error indicating that the revision could
@@ -703,6 +764,12 @@ func (m *nativeGitClient) lsRemote(revision string) (string, error) {
 		return revision, nil
 	}
 
+	// Normalize empty revision to HEAD upfront so that cache keys are consistent
+	// (lsRemote("") and lsRemote("HEAD") share the same cached entry).
+	if revision == "" {
+		revision = "HEAD"
+	}
+
 	// Check if we already resolved this revision recently. This is particularly beneficial
 	// when many applications point to the same repository and sync within the same cache window,
 	// as it avoids loading the full ref list (which can be 500k+ refs) from Redis on every request.
@@ -716,13 +783,34 @@ func (m *nativeGitClient) lsRemote(revision string) (string, error) {
 		}
 	}
 
+	// function that saves resolved revision to cache if caching is enabled
+	saveResolvedRevisionToCache := func(resolvedSHA string) {
+		if m.gitRefCache != nil && m.loadRefFromCache {
+			if err := m.gitRefCache.SetResolvedGitReference(m.repoURL, revision, resolvedSHA); err != nil {
+				log.Warnf("Failed to store resolved git reference to cache: %v", err)
+			}
+		}
+	}
+
+	// Semver constraints (e.g. "~1.2.0") require iterating the full tag list to find the
+	// maximum matching version, so they must go through getRefs(). For all other revision
+	// types (branches, tags, HEAD, fully-qualified refs) we attempt a targeted fetch first.
+	// Git protocol v2 sends ref-prefix hints during the ls-refs phase of a fetch, causing
+	// the server to return only the matching ref(s) rather than the entire list. This avoids
+	// both the expensive Redis read of the full ref set and the remote download of all refs.
+	if !versions.IsConstraint(revision) {
+		sha, err := m.lsRemoteViaFetch(revision)
+		if err == nil {
+			log.Debugf("LsRemote targeted fetch resolved revision '%s' to '%s'", revision, sha)
+			saveResolvedRevisionToCache(sha)
+			return sha, nil
+		}
+		log.Warnf("Targeted fetch for '%s' failed, falling back to full ref list: %v", revision, err)
+	}
+
 	refs, err := m.getRefs()
 	if err != nil {
 		return "", fmt.Errorf("failed to list refs: %w", err)
-	}
-
-	if revision == "" {
-		revision = "HEAD"
 	}
 
 	maxV, err := versions.MaxVersion(revision, getGitTags(refs))
@@ -746,16 +834,7 @@ func (m *nativeGitClient) lsRemote(revision string) (string, error) {
 	// This performance optimization is based on the observation coming from larger repositories where the number of refs can be in the order of tens of thousands, and we want to avoid calling Short() on every ref if we can determine up front that the supplied revision is not a short ref.
 	refTentative := plumbing.NewReferenceFromStrings(revision, "dummyHash")
 	isShortRef := refTentative.Name().Short() == revision
-	log.Debugf("Attempting to resolve revision '%s' (is short ref: %t)", revision, isShortRef)
-
-	// function that saves resolved revision to cache if caching is enabled
-	saveResolvedRevisionToCache := func(resolvedSHA string) {
-		if m.gitRefCache != nil && m.loadRefFromCache {
-			if err := m.gitRefCache.SetResolvedGitReference(m.repoURL, revision, resolvedSHA); err != nil {
-				log.Warnf("Failed to store resolved git reference to cache: %v", err)
-			}
-		}
-	}
+	log.Debugf("Attempting to resolve revision '%s' via full ref list (is short ref: %t)", revision, isShortRef)
 
 	for _, ref := range refs {
 		refName := ref.Name().String()

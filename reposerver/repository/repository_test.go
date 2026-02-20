@@ -419,14 +419,16 @@ func TestGenerateManifest_RefOnlyShortCircuit(t *testing.T) {
 	_, err := service.GenerateManifest(t.Context(), &q)
 	require.NoError(t, err)
 	cacheMocks.mockCache.AssertCacheCalledTimes(t, &repositorymocks.CacheCallCounts{
-		ExternalSets:             3,
-		ExternalGets:             3,
-		ExternalDeletesByPattern: 1,
+		ExternalSets:             1,
+		ExternalGets:             1,
+		ExternalDeletesByPattern: 0,
 	})
 	assert.True(t, lsremoteCalled, "ls-remote should be called when the source is ref only")
+	var sha string
+	require.NoError(t, cacheMocks.cacheutilCache.GetItem("git-resolved-refs|"+repoRemote+"|HEAD", &sha))
+	assert.Equal(t, revision, sha)
 	var revisions [][2]string
-	require.NoError(t, cacheMocks.cacheutilCache.GetItem("git-refs|"+repoRemote, &revisions))
-	assert.ElementsMatch(t, [][2]string{{"refs/heads/main", revision}, {"HEAD", "ref: refs/heads/main"}}, revisions)
+	require.ErrorIs(t, cache.ErrCacheMiss, cacheMocks.cacheutilCache.GetItem("git-refs|"+repoRemote, &revisions))
 }
 
 // Test that calling manifest generation on source helm reference helm files that when the revision is cached it does not call ls-remote
@@ -485,12 +487,12 @@ func TestGenerateManifestsHelmWithRefs_CachedNoLsRemote(t *testing.T) {
 		ProjectSourceRepos: []string{"*"},
 		RefSources:         map[string]*v1alpha1.RefTarget{"$ref": {TargetRevision: "HEAD", Repo: *repo}},
 	}
-	err = cacheMocks.cacheutilCache.SetItem("git-refs|"+repoRemote, [][2]string{{"HEAD", revision}}, nil)
+	err = cacheMocks.cacheutilCache.SetItem("git-resolved-refs|"+repoRemote+"|HEAD", revision, nil)
 	require.NoError(t, err)
 	_, err = service.GenerateManifest(t.Context(), &q)
 	require.NoError(t, err)
 	cacheMocks.mockCache.AssertCacheCalledTimes(t, &repositorymocks.CacheCallCounts{
-		ExternalSets: 3,
+		ExternalSets: 2,
 		ExternalGets: 5,
 	})
 }
