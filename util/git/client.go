@@ -840,7 +840,7 @@ func (m *nativeGitClient) lsRemote(revision string) (string, error) {
 
 	// function that saves resolved revision to cache if caching is enabled
 	saveResolvedRevisionToCache := func(resolvedSHA string) {
-		if m.gitRefCache != nil && m.loadRefFromCache {
+		if m.gitRefCache != nil {
 			if err := m.gitRefCache.SetResolvedGitReference(m.repoURL, revision, resolvedSHA); err != nil {
 				log.Warnf("Failed to store resolved git reference to cache: %v", err)
 			}
