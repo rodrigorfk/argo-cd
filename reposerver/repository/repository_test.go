@@ -429,7 +429,7 @@ func TestGenerateManifest_RefOnlyShortCircuit(t *testing.T) {
 	})
 	assert.True(t, lsRemoteViaFetchCalled, "ls-remote via fetch should be called when the source is ref only")
 	var input [][2]string
-	require.NoError(t, cacheMocks.cacheutilCache.GetItem("git-resolved-refs|"+repoRemote+"|HEAD", &input))
+	require.NoError(t, cacheMocks.cacheutilCache.GetItem("git-resolved-refs-v2|"+repoRemote+"|HEAD", &input))
 	assert.Equal(t, revision, input[0][1])
 	var revisions [][2]string
 	require.ErrorIs(t, cache.ErrCacheMiss, cacheMocks.cacheutilCache.GetItem("git-refs|"+repoRemote, &revisions))
@@ -496,7 +496,7 @@ func TestGenerateManifestsHelmWithRefs_CachedNoLsRemote(t *testing.T) {
 		ProjectSourceRepos: []string{"*"},
 		RefSources:         map[string]*v1alpha1.RefTarget{"$ref": {TargetRevision: "HEAD", Repo: *repo}},
 	}
-	err = cacheMocks.cacheutilCache.SetItem("git-resolved-refs|"+repoRemote+"|HEAD", [][2]string{{"", revision}}, nil)
+	err = cacheMocks.cacheutilCache.SetItem("git-resolved-refs-v2|"+repoRemote+"|HEAD", [][2]string{{"", revision}}, nil)
 	require.NoError(t, err)
 	_, err = service.GenerateManifest(t.Context(), &q)
 	require.NoError(t, err)

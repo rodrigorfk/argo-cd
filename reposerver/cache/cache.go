@@ -220,7 +220,7 @@ func gitRefsKey(repo string) string {
 }
 
 func gitResolvedRefsKey(repo, revision string) string {
-	return "git-resolved-refs|" + repo + "|" + revision
+	return "git-resolved-refs-v2|" + repo + "|" + revision
 }
 
 // SetGitReferences saves resolved Git repository references to cache
