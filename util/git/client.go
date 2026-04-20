@@ -746,14 +746,18 @@ func (m *nativeGitClient) lsRemoteViaFetch(revision string) (string, error) {
 	}()
 
 	// Construct a throw-away client that runs all git commands inside tmpDir,
-	// inheriting credentials, TLS, and proxy settings from the original client.
+	// inheriting credentials, TLS, proxy, and built-in git config from the
+	// original client. gitConfigEnv is required so the ArgoCD-mandated
+	// options (maintenance.autoDetach=false, gc.autoDetach=false) apply
+	// inside the tmpDir too.
 	tmpClient := &nativeGitClient{
-		repoURL:  m.repoURL,
-		root:     tmpDir,
-		creds:    m.creds,
-		insecure: m.insecure,
-		proxy:    m.proxy,
-		noProxy:  m.noProxy,
+		repoURL:      m.repoURL,
+		root:         tmpDir,
+		creds:        m.creds,
+		insecure:     m.insecure,
+		proxy:        m.proxy,
+		noProxy:      m.noProxy,
+		gitConfigEnv: m.gitConfigEnv,
 	}
 
 	ctx := context.Background()
@@ -761,13 +765,20 @@ func (m *nativeGitClient) lsRemoteViaFetch(revision string) (string, error) {
 		return "", fmt.Errorf("git init --bare failed: %w", err)
 	}
 
-	// --depth=1        → only the tip commit, no history
-	// --no-tags        → do not auto-follow tags
-	// --filter=tree:0  → partial-clone: omit tree and blob objects (commit metadata only)
-	//                    servers that do not support partial clone will ignore this flag
-	//                    and deliver the full commit object, which is still correct
+	// -c protocol.version=2 pins git protocol v2 so the fetch sends a
+	//                       ref-prefix hint and the server returns only the
+	//                       matching ref(s) instead of the full advertisement.
+	//                       Guards against env or config that might downgrade.
+	// --depth=1             only the tip commit, no history.
+	// --no-tags             do not auto-follow tags.
+	// --filter=tree:0       partial-clone: omit tree and blob objects
+	//                       (commit metadata only). Servers that do not
+	//                       support partial clone will ignore this flag and
+	//                       deliver the full commit object, which is still
+	//                       correct.
 	if err := tmpClient.runCredentialedCmd(
-		ctx, "fetch", "--depth=1", "--no-tags", "--filter=tree:0",
+		ctx, "-c", "protocol.version=2",
+		"fetch", "--depth=1", "--no-tags", "--filter=tree:0",
 		m.repoURL, revision,
 	); err != nil {
 		return "", fmt.Errorf("targeted fetch of %q failed: %w", revision, err)
